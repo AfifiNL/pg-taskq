@@ -32,7 +32,7 @@ jobs:
           --health-timeout 5s
           --health-retries 12
     env:
-      UV_FROZEN: "1"
+      UV_LOCKED: "1"  # fail if uv.lock is out of date with pyproject.toml
       PGTASKQ_TEST_DATABASE_URL: postgresql://taskq@localhost:5432/taskq
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

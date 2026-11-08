@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import sys
 from collections.abc import Sequence
@@ -16,6 +17,8 @@ import psycopg
 
 from pg_taskq import jobs, outbox
 from pg_taskq.schema import LATEST, migrate, schema_version
+
+MAX_DELAY_S = 10 * 365 * 24 * 3600  # ten years; beyond that a delay is almost surely a mistake
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -31,7 +34,8 @@ def _parser() -> argparse.ArgumentParser:
     e.add_argument("--max-attempts", type=int, default=5)
     e.add_argument("--key", default=None, help="idempotency key (unique per queue)")
     sub.add_parser("stats", help="job counts per queue and state, pending outbox messages")
-    sub.add_parser("reap", help="requeue jobs whose lease expired")
+    r = sub.add_parser("reap", help="requeue jobs whose lease expired")
+    r.add_argument("--limit", type=int, default=100, help="at most this many jobs (default 100)")
     return p
 
 
@@ -54,22 +58,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             except json.JSONDecodeError as exc:
                 print(f"error: payload is not JSON: {exc}", file=sys.stderr)
                 return 2
-            job_id = jobs.enqueue(
-                conn,
-                args.queue,
-                payload,
-                delay=dt.timedelta(seconds=args.delay),
-                priority=args.priority,
-                max_attempts=args.max_attempts,
-                idempotency_key=args.key,
-            )
+            if not (math.isfinite(args.delay) and 0 <= args.delay <= MAX_DELAY_S):
+                print(f"error: --delay must be between 0 and {MAX_DELAY_S} s", file=sys.stderr)
+                return 2
+            try:
+                job_id = jobs.enqueue(
+                    conn,
+                    args.queue,
+                    payload,
+                    delay=dt.timedelta(seconds=args.delay),
+                    priority=args.priority,
+                    max_attempts=args.max_attempts,
+                    idempotency_key=args.key,
+                )
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
             print(job_id)
             return 0
         if args.cmd == "stats":
             print(json.dumps({"jobs": jobs.stats(conn), "outbox_pending": outbox.pending(conn)}))
             return 0
         if args.cmd == "reap":
-            reaped = jobs.reap(conn)
+            if args.limit < 1:
+                print("error: --limit must be >= 1", file=sys.stderr)
+                return 2
+            reaped = jobs.reap(conn, limit=args.limit)
             print(json.dumps({"requeued": reaped.requeued, "dead": reaped.dead}))
             return 0
     return 2  # pragma: no cover - argparse rejects unknown commands

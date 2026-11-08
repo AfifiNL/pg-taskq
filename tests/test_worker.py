@@ -11,6 +11,8 @@ import pytest
 
 from pg_taskq import Backoff, Job, Worker, claim, enqueue, reap
 
+from .conftest import run_threads
+
 Conn = psycopg.Connection[Any]
 S = dt.timedelta(seconds=1)
 FAST = Backoff(base=dt.timedelta(milliseconds=10), cap=dt.timedelta(milliseconds=20))
@@ -80,14 +82,16 @@ def test_heartbeats_keep_a_long_job_alive(
         write_effect(job, c)
 
     worker = Worker(connect, "q", slow, worker_id="w1", lease=S, heartbeat_every=0.2)
-    t = threading.Thread(target=lambda: worker.run(max_jobs=1))
-    t.start()
-    assert running.wait(5)
-    deadline = time.monotonic() + 1.4
-    while time.monotonic() < deadline:  # a reaper running the whole time finds nothing
-        reaped += reap(conn).requeued
-        time.sleep(0.05)
-    t.join()
+
+    def reaper() -> None:  # a reaper running the whole time must find nothing
+        assert running.wait(5)
+        deadline = time.monotonic() + 1.4
+        with connect() as c:
+            while time.monotonic() < deadline:
+                reaped.extend(reap(c).requeued)
+                time.sleep(0.05)
+
+    run_threads(lambda: worker.run(max_jobs=1), reaper)
     assert reaped == []
     assert worker.stats.completed == 1
     assert job_state(conn, job_id) == "done"
@@ -142,3 +146,127 @@ def test_worker_reaps_a_crashed_workers_job(
 def test_heartbeat_interval_must_fit_the_lease(connect: Callable[[], Conn]) -> None:
     with pytest.raises(ValueError, match="heartbeat_every"):
         Worker(connect, "q", write_effect, worker_id="w", lease=S, heartbeat_every=1.0)
+
+
+@pytest.mark.parametrize("text", ["bad \x00 byte", "bad \udc80 byte"])
+def test_unstorable_handler_errors_are_recorded_and_the_worker_goes_on(
+    connect: Callable[[], Conn], conn: Conn, effects: None, text: str
+) -> None:
+    bad = enqueue(conn, "q", {"bad": True}, priority=1)
+    good = enqueue(conn, "q", {"bad": False})
+
+    def handler(job: Job, c: Conn) -> None:
+        if job.payload["bad"]:
+            raise RuntimeError(text)
+        write_effect(job, c)
+
+    stats = Worker(connect, "q", handler, worker_id="w1").run(max_jobs=2)
+    assert (stats.retried, stats.completed) == (1, 1)
+    assert job_state(conn, bad) == "queued"
+    assert job_state(conn, good) == "done"
+    row = conn.execute("SELECT last_error FROM taskq_jobs WHERE id = %s", (bad,)).fetchone()
+    assert row is not None
+    assert row[0].startswith("RuntimeError: bad \\")
+
+
+def named(dsn: str, name: str) -> Callable[[], Conn]:
+    return lambda: psycopg.connect(dsn, autocommit=True, application_name=name)
+
+
+def terminate(conn: Conn, name: str, state: str) -> int:
+    rows = conn.execute(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity"
+        " WHERE application_name = %s AND state = %s",
+        (name, state),
+    ).fetchall()
+    return len(rows)
+
+
+def test_heartbeat_connection_is_reopened_after_it_is_killed(
+    dsn: str, conn: Conn, effects: None
+) -> None:
+    job_id = enqueue(conn, "q")
+    started = threading.Event()
+
+    def slow(job: Job, c: Conn) -> None:
+        started.set()
+        time.sleep(1.8)  # well past the 1 s lease: only working heartbeats keep the job
+        write_effect(job, c)
+
+    worker = Worker(named(dsn, "hb-test"), "q", slow, worker_id="w1", lease=S, heartbeat_every=0.2)
+    killed: list[int] = []
+    reaped: list[int] = []
+
+    def saboteur() -> None:
+        assert started.wait(5)
+        time.sleep(0.3)  # let a first heartbeat happen, then kill the idle heartbeat backend
+        with connect_plain(dsn) as c:
+            killed.append(terminate(c, "hb-test", "idle"))
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline:
+                reaped.extend(reap(c).requeued)
+                time.sleep(0.05)
+
+    run_threads(lambda: worker.run(max_jobs=1), saboteur)
+    assert killed == [1]
+    assert reaped == []
+    assert worker.stats.reconnects >= 1
+    assert worker.stats.completed == 1
+    assert job_state(conn, job_id) == "done"
+
+
+def connect_plain(dsn: str) -> Conn:
+    return psycopg.connect(dsn, autocommit=True)
+
+
+def test_main_connection_is_reopened_after_it_is_killed(dsn: str, conn: Conn) -> None:
+    fast = Backoff(base=dt.timedelta(milliseconds=20), cap=dt.timedelta(milliseconds=50))
+    done = threading.Event()
+
+    def handler(job: Job, c: Conn) -> None:
+        done.set()
+
+    worker = Worker(
+        named(dsn, "main-test"),
+        "q",
+        handler,
+        worker_id="w1",
+        poll_interval=0.05,
+        reconnect_backoff=fast,
+    )
+
+    def saboteur() -> None:
+        try:
+            time.sleep(0.3)
+            deadline = time.monotonic() + 5
+            while not terminate(conn, "main-test", "idle"):  # idle between two polls
+                assert time.monotonic() < deadline, "never saw the worker's idle connection"
+                time.sleep(0.01)
+            enqueue(conn, "q")
+            assert done.wait(5)
+        finally:
+            worker.stop()
+
+    run_threads(worker.run, saboteur)
+    assert worker.stats.completed == 1
+    assert worker.stats.reconnects >= 1
+
+
+def test_non_transactional_mode_completes_and_keeps_committed_writes(
+    connect: Callable[[], Conn], conn: Conn, effects: None
+) -> None:
+    ok = enqueue(conn, "q", {"lose": False})
+    lost = enqueue(conn, "q", {"lose": True})
+    other = connect()
+
+    def handler(job: Job, c: Conn) -> None:
+        assert c.autocommit  # no transaction held open for the job
+        write_effect(job, c)  # committed at once
+        if job.payload["lose"]:
+            reap(other, now=dt.datetime.now(dt.UTC) + 3600 * S)
+
+    stats = Worker(connect, "q", handler, worker_id="w1", transactional=False).run(max_jobs=2)
+    assert (stats.completed, stats.lost) == (1, 1)
+    assert job_state(conn, ok) == "done"
+    assert job_state(conn, lost) == "queued"  # fenced: the stale worker could not complete it
+    assert count_effects(conn) == 2  # but its committed write stays: make handlers idempotent

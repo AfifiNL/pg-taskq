@@ -5,19 +5,26 @@ attempt (a transient error) and is retried with backoff; one poison job always f
 dead; one job is claimed by a worker that then "crashes", and the others reap its lease. Each
 successful job records its result and an outbox message in the same transaction as completing
 the job; a relay then publishes the messages.
+
+Database: a throwaway PostgreSQL from the `pgserver` package, or, when PGTASKQ_TEST_DATABASE_URL
+is set (CI), that database, inside a schema created for the demo and dropped afterwards.
+The demo checks its own outcome and exits non-zero if anything is off, so `make check` runs it.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import os
+import secrets
 import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
-import pgserver  # type: ignore[import-untyped]
 import psycopg
+from psycopg import sql
+from psycopg.conninfo import make_conninfo
 
 from pg_taskq import Backoff, Job, Worker, claim, enqueue, migrate, outbox, stats
 from pg_taskq.outbox import OutboxMessage
@@ -36,11 +43,23 @@ def handler(job: Job, conn: psycopg.Connection[Any]) -> None:
 
 
 def main() -> None:
+    url = os.environ.get("PGTASKQ_TEST_DATABASE_URL")
+    if url:
+        schema = f"taskq_demo_{secrets.token_hex(4)}"
+        with psycopg.connect(url, autocommit=True) as conn:
+            conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+        try:
+            run(make_conninfo(url, options=f"-csearch_path={schema}"))
+        finally:
+            with psycopg.connect(url, autocommit=True) as conn:
+                conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+        return
+    import pgserver  # type: ignore[import-untyped]  # local only: `make install`
+
     with tempfile.TemporaryDirectory(prefix="pgtaskq-demo-") as tmp:
         server = pgserver.get_server(Path(tmp) / "pgdata", cleanup_mode="stop")
-        dsn = server.get_uri()
         try:
-            run(dsn)
+            run(server.get_uri())
         finally:
             server.cleanup()
 
@@ -100,6 +119,13 @@ def run(dsn: str) -> None:
         while outbox.relay_once(conn, published.append, limit=25).published:
             pass
         print(f"outbox: published {len(published)} messages, {outbox.pending(conn)} pending")
+
+        # The demo is also a smoke test (`make check` runs it): check the outcome.
+        if stats(conn)[QUEUE] != {"done": 40, "dead": 1} or len(published) != 40 or not row:
+            raise SystemExit("demo: unexpected outcome")
+        if row[0] != 40 or [d[0] for d in dead] != ["99"] or outbox.pending(conn) != 0:
+            raise SystemExit("demo: unexpected outcome")
+        print("demo: OK")
 
 
 if __name__ == "__main__":

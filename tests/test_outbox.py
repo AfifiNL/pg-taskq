@@ -12,7 +12,7 @@ import pytest
 from pg_taskq import Backoff, outbox
 from pg_taskq.outbox import OutboxError, OutboxMessage
 
-from .conftest import T0
+from .conftest import run_threads
 
 Conn = psycopg.Connection[Any]
 S = dt.timedelta(seconds=1)
@@ -100,11 +100,7 @@ def test_parallel_relays_take_disjoint_batches(connect: Callable[[], Conn]) -> N
             while outbox.relay_once(conn, publish, limit=7).published:
                 pass
 
-    threads = [threading.Thread(target=relay) for _ in range(4)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    run_threads(*[relay for _ in range(4)])
     assert sorted(published) == all_ids  # each message exactly once in a crash-free run
 
 
@@ -122,8 +118,31 @@ def test_relay_crash_mid_batch_republishes(conn: Conn) -> None:
             raise Crash
 
     with pytest.raises(Crash):
-        outbox.relay_once(conn, crashing, now=T0 + dt.timedelta(days=3650))
+        outbox.relay_once(conn, crashing)
     assert outbox.pending(conn) == 3  # nothing was marked: the first message goes out again
     result = outbox.relay_once(conn, lambda m: calls.append(m.id))
     assert result.published == ids
     assert calls.count(ids[0]) == 2  # at-least-once: consumers deduplicate by id
+
+
+@pytest.mark.parametrize("text", ["broker said: \x00", "bad \udc80 byte"])
+def test_unstorable_publisher_errors_do_not_wedge_the_relay(conn: Conn, text: str) -> None:
+    with conn.transaction():
+        first = outbox.add(conn, "t", {"n": 1})
+        bad = outbox.add(conn, "t", {"n": 2})
+    sent: list[int] = []
+
+    def publish(msg: OutboxMessage) -> None:
+        if msg.id == bad:
+            raise RuntimeError(text)
+        sent.append(msg.id)
+
+    result = outbox.relay_once(conn, publish)
+    assert result.published == [first]
+    assert result.failed == [bad]
+    row = conn.execute("SELECT last_error FROM taskq_outbox WHERE id = %s", (bad,)).fetchone()
+    assert row is not None
+    assert "\\x00" in row[0] or "\\udc80" in row[0]
+    # The first message was marked published: a second relay does not resend it.
+    assert outbox.relay_once(conn, publish).published == []
+    assert sent == [first]

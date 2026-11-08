@@ -20,7 +20,7 @@ from psycopg.pq import TransactionStatus
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from pg_taskq.jobs import MAX_ERROR_CHARS, NOW, Backoff
+from pg_taskq.jobs import NOW, Backoff, check_aware, check_name, describe_error
 
 
 class OutboxError(RuntimeError):
@@ -55,8 +55,9 @@ def add(
     Refuses to run on an autocommit connection outside a transaction block: there the message
     would commit on its own, which defeats the pattern.
     """
-    if not topic:
-        raise ValueError("topic must be a non-empty string")
+    check_name(topic, "topic")
+    if key is not None:
+        check_name(key, "key")
     if conn.autocommit and conn.info.transaction_status == TransactionStatus.IDLE:
         raise OutboxError(
             "outbox.add() must run inside the transaction that makes the change "
@@ -79,7 +80,12 @@ def relay_once(
     backoff: Backoff | None = None,
     now: dt.datetime | None = None,
 ) -> RelayResult:
-    """Publish up to `limit` pending messages in id order, in one transaction.
+    """Publish up to `limit` due messages, in one transaction.
+
+    Within a batch, messages go out in id order. That is not a delivery-order guarantee: ids are
+    assigned at insert, not at commit, so a message from a transaction that commits late can
+    follow one with a higher id; a failed message waits for its retry while later ones go out;
+    and parallel relays interleave. Consumers that need order must sort or version by payload.
 
     The rows stay locked (`FOR UPDATE SKIP LOCKED`) while `publish` runs, so parallel relays
     take disjoint batches. A message whose publish raises is not marked published; it gets
@@ -87,6 +93,7 @@ def relay_once(
     stop the rest of the batch. If the relay process dies mid-batch, the transaction rolls back
     and the whole batch is retried (at-least-once).
     """
+    check_aware(now, "now")
     if limit < 1:
         raise ValueError("limit must be >= 1")
     policy = backoff or Backoff()
@@ -120,7 +127,7 @@ def relay_once(
                     """,  # noqa: S608
                     {
                         "id": msg.id,
-                        "error": f"{type(exc).__name__}: {exc}"[:MAX_ERROR_CHARS],
+                        "error": describe_error(exc),
                         "delay": policy.delay(msg.attempts + 1),
                         "now": now,
                     },

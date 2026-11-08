@@ -229,3 +229,55 @@ def test_complete_inside_callers_transaction_rolls_back_together(conn: Conn) -> 
         raise RuntimeError("crash before commit")
     assert state(conn, job_id)["state"] == "running"
     assert conn.execute("SELECT count(*) FROM effects").fetchone() == (0,)
+
+
+NAIVE = dt.datetime(2030, 1, 1)  # deliberately naive (no tzinfo)
+
+
+def test_naive_datetimes_are_rejected(conn: Conn) -> None:
+    enqueue(conn, "q", now=T0)
+    [job] = claim(conn, "q", "w", now=T0)
+    calls: list[Callable[[], object]] = [
+        lambda: enqueue(conn, "q", now=NAIVE),
+        lambda: enqueue(conn, "q", run_at=NAIVE),
+        lambda: claim(conn, "q", "w", now=NAIVE),
+        lambda: heartbeat(conn, job, now=NAIVE),
+        lambda: complete(conn, job, now=NAIVE),
+        lambda: fail(conn, job, "x", now=NAIVE),
+        lambda: reap(conn, now=NAIVE),
+    ]
+    for call in calls:
+        with pytest.raises(ValueError, match="timezone-aware"):
+            call()
+    assert complete(conn, job, now=T0)  # nothing above changed the job
+
+
+@pytest.mark.parametrize(
+    ("error", "stored"),
+    [
+        ("broker said: \x00", "broker said: \\x00"),
+        ("bad \udc80 byte", "bad \\udc80 byte"),
+    ],
+)
+def test_error_text_is_made_storable(conn: Conn, error: str, stored: str) -> None:
+    job_id = enqueue(conn, "q", now=T0)
+    [job] = claim(conn, "q", "w", now=T0)
+    assert fail(conn, job, error, now=T0) is FailOutcome.RETRY
+    assert state(conn, job_id)["last_error"] == stored
+
+
+@pytest.mark.parametrize("name", ["", "nul\x00name", "surrogate\udc80"])
+def test_names_must_be_storable(conn: Conn, name: str) -> None:
+    with pytest.raises(ValueError, match="queue"):
+        enqueue(conn, name)
+    with pytest.raises(ValueError, match="worker_id"):
+        claim(conn, "q", name)
+
+
+def test_numeric_bounds_are_checked_before_the_database(conn: Conn) -> None:
+    with pytest.raises(ValueError, match="priority"):
+        enqueue(conn, "q", priority=2**31)
+    with pytest.raises(ValueError, match="max_attempts"):
+        enqueue(conn, "q", max_attempts=2**31)
+    with pytest.raises(ValueError, match="limit"):
+        reap(conn, limit=0)

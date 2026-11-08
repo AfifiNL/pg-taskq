@@ -32,7 +32,7 @@ typecheck:       ## mypy (strict)
 test:            ## pytest, including the PostgreSQL integration and property tests
 	$(UV) run $(PG_GROUP) pytest
 
-check: lint typecheck test  ## everything CI runs
+check: lint typecheck test demo  ## everything CI runs
 
 demo:            ## 3 workers, retries, a crashed worker, a poison job and the outbox, end to end
-	$(UV) run --group localpg python examples/demo.py
+	$(UV) run $(PG_GROUP) python examples/demo.py

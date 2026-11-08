@@ -34,6 +34,41 @@ from psycopg.types.json import Jsonb
 
 NOW: Final = "coalesce(%(now)s::timestamptz, statement_timestamp())"
 MAX_ERROR_CHARS: Final = 2000
+INT32_MAX: Final = 2**31 - 1
+
+
+def clean_text(text: str, limit: int = MAX_ERROR_CHARS) -> str:
+    """Make arbitrary text (an exception message, say) safe to store in a PostgreSQL `text`
+    column: NUL bytes are not allowed there and lone surrogates cannot be encoded as UTF-8.
+    Both are written as backslash escapes; the result is capped at `limit` characters."""
+    escaped = text.replace("\x00", "\\x00").encode("utf-8", "backslashreplace").decode("utf-8")
+    return escaped[:limit]
+
+
+def describe_error(exc: BaseException) -> str:
+    """`Type: message`, storable, even when the exception's own __str__ misbehaves."""
+    try:
+        message = str(exc)
+    except Exception:  # an exception whose __str__ raises must not take the worker down
+        message = "<unprintable exception message>"
+    return clean_text(f"{type(exc).__name__}: {message}" if message else type(exc).__name__)
+
+
+def check_name(value: str, what: str) -> str:
+    """Queue, worker and topic names: non-empty and storable (no NUL, valid UTF-8)."""
+    if not value:
+        raise ValueError(f"{what} must be a non-empty string")
+    if clean_text(value, limit=len(value) * 10 + 10) != value:
+        raise ValueError(f"{what} contains a NUL byte or an unencodable character")
+    return value
+
+
+def check_aware(value: dt.datetime | None, what: str) -> dt.datetime | None:
+    """Reject naive datetimes: PostgreSQL would read them in the session's TimeZone setting,
+    so the same call would mean different instants on differently configured connections."""
+    if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+        raise ValueError(f"{what} must be timezone-aware (for example datetime.now(UTC))")
+    return value
 
 
 class FailOutcome(StrEnum):
@@ -103,10 +138,15 @@ def enqueue(
 ) -> int:
     """Add a job and return its id. With an `idempotency_key` that already exists in this queue,
     nothing is inserted and the existing job's id is returned (whatever its state)."""
-    if not queue:
-        raise ValueError("queue must be a non-empty string")
-    if max_attempts < 1:
-        raise ValueError("max_attempts must be >= 1")
+    check_name(queue, "queue")
+    check_aware(run_at, "run_at")
+    check_aware(now, "now")
+    if idempotency_key is not None:
+        check_name(idempotency_key, "idempotency_key")
+    if not 1 <= max_attempts <= INT32_MAX:
+        raise ValueError("max_attempts must be between 1 and 2**31 - 1")
+    if not -INT32_MAX - 1 <= priority <= INT32_MAX:
+        raise ValueError("priority must fit in a 32-bit integer")
     if run_at is not None and delay is not None:
         raise ValueError("pass run_at or delay, not both")
     params = {
@@ -156,6 +196,9 @@ def claim(
     now instead of waiting for them, so N workers never block each other and never get the same
     row. Each claim counts as an attempt.
     """
+    check_name(queue, "queue")
+    check_name(worker_id, "worker_id")
+    check_aware(now, "now")
     if limit < 1:
         raise ValueError("limit must be >= 1")
     if lease <= dt.timedelta(0):
@@ -191,6 +234,9 @@ def heartbeat(
     now: dt.datetime | None = None,
 ) -> bool:
     """Extend the lease to now + `lease`. False means the lease was lost: stop working on it."""
+    check_aware(now, "now")
+    if lease <= dt.timedelta(0):
+        raise ValueError("lease must be positive")
     with conn.transaction():
         cur = conn.execute(
             f"""
@@ -204,6 +250,7 @@ def heartbeat(
 
 def complete(conn: psycopg.Connection[Any], job: Job, *, now: dt.datetime | None = None) -> bool:
     """Mark the job done. False (and no change) when the caller no longer holds the lease."""
+    check_aware(now, "now")
     with conn.transaction():
         cur = conn.execute(
             f"""
@@ -228,6 +275,7 @@ def fail(
 ) -> FailOutcome:
     """Record a failed attempt: requeue after a backoff delay, or mark dead when the attempts
     are used up (or `retry=False`). Returns LOST, changing nothing, without a valid lease."""
+    check_aware(now, "now")
     delay = (backoff or Backoff()).delay(max(job.attempts, 1))
     with conn.transaction():
         row = conn.execute(
@@ -249,7 +297,7 @@ def fail(
                 "token": job.lease_token,
                 "retry": retry,
                 "delay": delay,
-                "error": error[:MAX_ERROR_CHARS],
+                "error": clean_text(error),
                 "now": now,
             },
         ).fetchone()
@@ -275,6 +323,9 @@ def reap(
     A reaped job is requeued at once, or marked dead when the crashed attempt was its last.
     The attempt is not refunded: a job that crashes its worker every time must die eventually.
     """
+    check_aware(now, "now")
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
     with conn.transaction():
         rows = conn.execute(
             f"""

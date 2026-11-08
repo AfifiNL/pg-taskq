@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import threading
 from collections import Counter
 from collections.abc import Callable
@@ -10,6 +11,8 @@ from typing import Any
 import psycopg
 
 from pg_taskq import claim, complete, enqueue, stats
+
+from .conftest import run_threads
 
 Conn = psycopg.Connection[Any]
 JOBS = 400
@@ -32,11 +35,7 @@ def test_no_job_is_claimed_twice(connect: Callable[[], Conn], conn: Conn) -> Non
                         claimed.append((job.id, name))
                     assert complete(c, job)
 
-    threads = [threading.Thread(target=work, args=(f"w{i}",)) for i in range(WORKERS)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    run_threads(*[functools.partial(work, f"w{i}") for i in range(WORKERS)])
     counts = Counter(job_id for job_id, _ in claimed)
     assert len(counts) == JOBS
     assert max(counts.values()) == 1

@@ -7,9 +7,13 @@ requires-python = ">=3.12"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "Hossam Afifi" }]
+# psycopg needs libpq: either the system's, or the bundled one from the `binary` extra.
 dependencies = [
-    "psycopg[binary]>=3.2",
+    "psycopg>=3.2",
 ]
+
+[project.optional-dependencies]
+binary = ["psycopg[binary]>=3.2"]
 
 [project.urls]
 Repository = "https://github.com/AfifiNL/pg-taskq"
@@ -23,13 +27,14 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "hypothesis>=6.100",
+    "psycopg[binary]>=3.2",
 ]
 localpg = [
     "pgserver>=0.1.4",
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]  # PEP 639 license metadata
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
