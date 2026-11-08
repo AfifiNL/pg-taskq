@@ -10,7 +10,7 @@ else
 PG_GROUP := --group localpg
 endif
 
-.PHONY: help install lint fmt typecheck test check demo
+.PHONY: help install lint fmt typecheck test check demo bench
 
 help:            ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | sed 's/:.*## /\t/'
@@ -19,12 +19,12 @@ install:         ## create .venv with dev tools and the bundled PostgreSQL (lock
 	$(UV) sync --group localpg
 
 lint:            ## ruff lint + format check
-	$(UV) run ruff check src tests examples
-	$(UV) run ruff format --check src tests examples
+	$(UV) run ruff check src tests examples bench
+	$(UV) run ruff format --check src tests examples bench
 
 fmt:             ## apply ruff formatting and safe fixes
-	$(UV) run ruff format src tests examples
-	$(UV) run ruff check --fix src tests examples
+	$(UV) run ruff format src tests examples bench
+	$(UV) run ruff check --fix src tests examples bench
 
 typecheck:       ## mypy (strict)
 	$(UV) run mypy
@@ -36,3 +36,6 @@ check: lint typecheck test demo  ## everything CI runs
 
 demo:            ## 3 workers, retries, a crashed worker, a poison job and the outbox, end to end
 	$(UV) run $(PG_GROUP) python examples/demo.py
+
+bench:           ## local benchmark (not part of check): 8 worker processes x 20,000 jobs
+	$(UV) run --group localpg python bench/bench.py

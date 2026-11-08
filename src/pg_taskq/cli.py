@@ -1,4 +1,4 @@
-"""Command line: `pg-taskq migrate | enqueue | stats | reap`.
+"""Command line: `pg-taskq migrate | enqueue | stats | reap | prune`.
 
 The connection string comes from `--dsn` or the PGTASKQ_DSN environment variable.
 """
@@ -16,6 +16,7 @@ from collections.abc import Sequence
 import psycopg
 
 from pg_taskq import jobs, outbox
+from pg_taskq.retention import prune
 from pg_taskq.schema import LATEST, migrate, schema_version
 
 MAX_DELAY_S = 10 * 365 * 24 * 3600  # ten years; beyond that a delay is almost surely a mistake
@@ -36,6 +37,17 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("stats", help="job counts per queue and state, pending outbox messages")
     r = sub.add_parser("reap", help="requeue jobs whose lease expired")
     r.add_argument("--limit", type=int, default=100, help="at most this many jobs (default 100)")
+    pr = sub.add_parser("prune", help="delete old finished jobs and published outbox messages")
+    pr.add_argument(
+        "--older-than",
+        type=float,
+        required=True,
+        metavar="SECONDS",
+        help="only rows finished/published more than this many seconds ago",
+    )
+    pr.add_argument("--states", default="done,dead", help="job states to prune (default done,dead)")
+    pr.add_argument("--no-outbox", action="store_true", help="leave outbox messages alone")
+    pr.add_argument("--batch", type=int, default=1000, help="rows per transaction (default 1000)")
     return p
 
 
@@ -85,6 +97,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 2
             reaped = jobs.reap(conn, limit=args.limit)
             print(json.dumps({"requeued": reaped.requeued, "dead": reaped.dead}))
+            return 0
+        if args.cmd == "prune":
+            if not (math.isfinite(args.older_than) and 0 <= args.older_than <= MAX_DELAY_S):
+                print(f"error: --older-than must be between 0 and {MAX_DELAY_S} s", file=sys.stderr)
+                return 2
+            try:
+                pruned = prune(
+                    conn,
+                    dt.timedelta(seconds=args.older_than),
+                    states=[s.strip() for s in args.states.split(",") if s.strip()],
+                    outbox=not args.no_outbox,
+                    batch=args.batch,
+                )
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
+            print(json.dumps({"jobs": pruned.jobs, "outbox": pruned.outbox}))
             return 0
     return 2  # pragma: no cover - argparse rejects unknown commands
 

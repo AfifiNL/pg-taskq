@@ -7,6 +7,7 @@ from pg_taskq.jobs import (
     FailOutcome,
     Job,
     Reaped,
+    channel_for,
     claim,
     complete,
     enqueue,
@@ -15,6 +16,7 @@ from pg_taskq.jobs import (
     reap,
     stats,
 )
+from pg_taskq.retention import Pruned, prune
 from pg_taskq.schema import migrate, schema_version
 from pg_taskq.worker import LeaseLostError, Worker, WorkerStats
 
@@ -25,9 +27,11 @@ __all__ = [
     "FailOutcome",
     "Job",
     "LeaseLostError",
+    "Pruned",
     "Reaped",
     "Worker",
     "WorkerStats",
+    "channel_for",
     "claim",
     "complete",
     "enqueue",
@@ -35,6 +39,7 @@ __all__ = [
     "heartbeat",
     "migrate",
     "outbox",
+    "prune",
     "reap",
     "schema_version",
     "stats",

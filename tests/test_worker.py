@@ -173,11 +173,14 @@ def named(dsn: str, name: str) -> Callable[[], Conn]:
     return lambda: psycopg.connect(dsn, autocommit=True, application_name=name)
 
 
-def terminate(conn: Conn, name: str, state: str) -> int:
+def terminate_idle(conn: Conn, name: str) -> int:
+    """Kill the worker's idle backends whose last statement was a COMMIT: the heartbeat or loop
+    connection between two statements. The LISTEN connection (last statement LISTEN) and a
+    handler's open transaction ("idle in transaction") are left alone."""
     rows = conn.execute(
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity"
-        " WHERE application_name = %s AND state = %s",
-        (name, state),
+        " WHERE application_name = %s AND state = 'idle' AND query = 'COMMIT'",
+        (name,),
     ).fetchall()
     return len(rows)
 
@@ -201,7 +204,7 @@ def test_heartbeat_connection_is_reopened_after_it_is_killed(
         assert started.wait(5)
         time.sleep(0.3)  # let a first heartbeat happen, then kill the idle heartbeat backend
         with connect_plain(dsn) as c:
-            killed.append(terminate(c, "hb-test", "idle"))
+            killed.append(terminate_idle(c, "hb-test"))
             deadline = time.monotonic() + 1.5
             while time.monotonic() < deadline:
                 reaped.extend(reap(c).requeued)
@@ -239,7 +242,8 @@ def test_main_connection_is_reopened_after_it_is_killed(dsn: str, conn: Conn) ->
         try:
             time.sleep(0.3)
             deadline = time.monotonic() + 5
-            while not terminate(conn, "main-test", "idle"):  # idle between two polls
+            # The loop connection, idle between two polls (its last statement was a claim).
+            while not terminate_idle(conn, "main-test"):
                 assert time.monotonic() < deadline, "never saw the worker's idle connection"
                 time.sleep(0.01)
             enqueue(conn, "q")

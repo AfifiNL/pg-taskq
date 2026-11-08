@@ -68,6 +68,16 @@ MIGRATIONS: list[tuple[int, str]] = [
             ON taskq_outbox (available_at, id) WHERE published_at IS NULL;
         """,
     ),
+    (
+        2,
+        """
+        -- For prune(): finished jobs and published messages by age.
+        CREATE INDEX taskq_jobs_finished
+            ON taskq_jobs (finished_at) WHERE state IN ('done', 'dead');
+        CREATE INDEX taskq_outbox_published
+            ON taskq_outbox (published_at) WHERE published_at IS NOT NULL;
+        """,
+    ),
 ]
 
 LATEST = MIGRATIONS[-1][0]

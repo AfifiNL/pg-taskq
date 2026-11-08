@@ -59,9 +59,9 @@ transactions"; a review caught the contradiction. The option is the smallest cha
 both properties available and the trade-off explicit. Effects outside the database (e-mail,
 HTTP calls) are at-least-once in both modes.
 
-**Connection loss is a normal event.** The worker keeps its loop/handler connection and its
-heartbeat connection behind a small wrapper that re-opens a closed or broken connection on next
-use. A failed heartbeat drops the connection and the next beat reconnects (the lease has slack:
+**Connection loss is a normal event.** The worker keeps its loop/handler, heartbeat and LISTEN
+connections behind a small wrapper that re-opens a closed or broken connection on next use (the
+LISTEN connection re-issues its LISTEN). A failed heartbeat drops the connection and the next beat reconnects (the lease has slack:
 beats run every lease/3 by default). A connection error while claiming or reaping is logged and
 retried with backoff (200 ms doubling to 10 s); `run()` does not exit. If a handler's failure
 cannot be recorded because the connection broke, the job is left to the reaper, which requeues
@@ -89,7 +89,8 @@ the random half spreads out jobs that failed together. Computed in float seconds
 
 **Idempotency keys are unique per queue, for the life of the row.** A duplicate enqueue returns
 the existing job's id whatever its state, so "enqueue once per order" holds even after the job
-finished. There is no pruning yet (see limits), so the window is the table's lifetime.
+finished. The window ends when `prune()` deletes the row: after that the same key creates a new
+job. Choose the retention period with that in mind.
 
 **Transactional outbox.** `outbox.add()` inserts in the caller's transaction, so a message exists
 if and only if the change it describes committed. It refuses to run on an autocommit connection
@@ -103,8 +104,37 @@ commit, a failed message waits for its retry while later ones go out, and parall
 interleave. A per-key ordering would need the relay to stop at a key's first failure and a
 single relay per key; that is not built.
 
-**Polling, not LISTEN/NOTIFY.** Idle workers poll every `poll_interval` (1 s by default). It is
-simpler and has no lost-notification edge cases; the cost is up to one poll interval of latency.
+**Wake-ups: LISTEN/NOTIFY, with polling as the safety net.** A job that is due at once makes
+`enqueue()` call `pg_notify()` on its queue's channel in the same transaction; PostgreSQL delivers
+it at commit, and only then, so a rolled-back enqueue wakes nobody, and several enqueues in one
+transaction fold into one notification. The reaper notifies the queues of the jobs it requeues.
+Delayed jobs and retries (whose `run_at` is in the future) send nothing: nobody could take them
+yet. Each `Worker` keeps a third connection that only LISTENs; when a claim comes back empty it
+waits on that connection for up to `poll_interval`, in 0.25 s slices so `stop()` stays prompt.
+A notification only shortens the wait. If one is lost (the listening connection broke, a job was
+enqueued with `notify=False`, a connection pooler in transaction mode swallowed it), the next poll
+finds the job. Polling is the correctness mechanism; notifications are a latency optimisation.
+
+- The LISTEN is (re-)established *before* each claim. A job committed between an empty claim and
+  the wait therefore leaves a notification waiting, and the wait returns at once.
+- Channel names are `taskq_` plus 24 hex characters of the queue name's SHA-256: always a short,
+  lowercase, valid identifier, whatever the queue is called (spaces, quotes, non-ASCII, longer
+  than PostgreSQL's 63-byte limit). `pg_notify()` takes the channel as a bound value and LISTEN
+  uses `sql.Identifier`, so nothing is spliced into SQL.
+- A bug found while building this: psycopg's `notifies()` generator holds the connection's lock
+  while it is suspended, so draining extra notifications from inside the loop over the first one
+  deadlocked the worker. The test that kills the worker's main connection hung on it; the code
+  now closes the first generator before draining.
+
+**Retention in small batches.** `prune()` deletes `done`/`dead` jobs and published outbox messages
+older than a cut-off, in batches (`LIMIT` + `FOR UPDATE SKIP LOCKED`, 1,000 rows by default), each
+batch its own short transaction. It never waits on rows someone else holds and never holds many
+locks itself, so it can run next to busy workers (tested: four workers drain 600 jobs while a
+pruner deletes them as they finish; every job is processed once and deleted once). Queued and
+running jobs are never eligible; passing such a state is a `ValueError`. Pruning a job frees its
+idempotency key. Migration 2 adds the two partial indexes `prune()` uses. It runs inside the
+migration transaction, so it cannot use `CREATE INDEX CONCURRENTLY`: on a large existing table,
+apply it at a quiet time.
 
 **Schema.** Fixed table names (`taskq_jobs`, `taskq_outbox`, `taskq_schema_version`) in the
 connection's `search_path`. Numbered migrations run in one transaction under a transaction-scoped
@@ -129,8 +159,8 @@ re-raised in the test (a failing assertion in a plain thread only produces a war
   draining at the end must leave every job done or dead. Pinned `@example`s cover the chain
   "claim, lease expires, reaped, re-claimed by another worker, the stale worker completes /
   heartbeats / fails" and a last attempt expiring.
-- **What the property test does and does not catch, measured by mutation.** Five bugs were
-  planted one at a time (`claim()` may take running jobs; `complete()`, `heartbeat()` or `fail()`
+- **What the property test does and does not catch, measured by mutation** (re-run on the
+  final code, full suite, same result). Five bugs were planted one at a time (`claim()` may take running jobs; `complete()`, `heartbeat()` or `fail()`
   ignore the lease token; `reap()` without `SKIP LOCKED`). The property test fails on the first
   four. It cannot see the fifth: it runs on one connection, where `SKIP LOCKED` changes nothing.
   That one is caught only by `test_an_open_reap_does_not_block_another`, which holds one reap
@@ -148,5 +178,22 @@ re-raised in the test (a failing assertion in a plain thread only produces a war
   the job still completes; killing the idle main connection is survived; NUL and lone-surrogate
   error text is stored escaped and the worker carries on; both worker modes are tested against a
   lost lease.
+- **Wake-ups:** a worker idling with a 30 s poll interval picks up a newly enqueued job in well
+  under a second; a job enqueued with `notify=False` (a lost notification) is still found by the
+  next poll; killing the LISTEN connection falls back to polling and re-LISTENs; notifications are
+  sent on commit only, folded within a transaction, and not sent for delayed jobs or other queues.
+- **Retention:** only old `done`/`dead` rows and published messages go; prune running next to four
+  claiming workers, and four prunes in parallel, each delete every row exactly once; migrating a
+  version-1 schema to version 2 adds the indexes.
 - **The demo is a smoke test.** `make check` runs it and it exits non-zero unless 40 jobs end
   done, the poison job ends dead and all 40 outbox messages are published.
+
+## Benchmark method
+
+`bench/bench.py` (`make bench`) uses separate processes, not threads, so the numbers include no
+GIL contention between workers. Each scenario gets its own queue of no-op jobs, enqueued in one
+transaction with `notify=False` (setup, not measured). A barrier releases all workers at once;
+wall time runs from the barrier to the last result. Claim latency is timed around each `claim()`
+call in the loop scenarios (the `Worker` scenario reports throughput only). The run fails unless
+every job id appears exactly once across processes and the database counts every job `done`.
+Results, machine details and caveats are in the README; they are from two runs on one machine.

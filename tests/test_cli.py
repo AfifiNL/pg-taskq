@@ -11,7 +11,7 @@ import psycopg
 import pytest
 from psycopg import sql
 
-from pg_taskq import claim, enqueue
+from pg_taskq import claim, complete, enqueue
 from pg_taskq.cli import main
 
 from .conftest import in_schema
@@ -68,6 +68,9 @@ def test_cli_requires_migrated_schema(server_url: str, capsys: pytest.CaptureFix
         (["enqueue", "q", "{}", "--delay", "-1"], "--delay"),
         (["enqueue", "q", "{}", "--priority", str(2**40)], "priority"),
         (["reap", "--limit", "0"], "--limit"),
+        (["prune", "--older-than", "inf"], "--older-than"),
+        (["prune", "--older-than", "60", "--states", "queued"], "subset"),
+        (["prune", "--older-than", "60", "--batch", "0"], "batch"),
     ],
 )
 def test_cli_bad_arguments_are_clean_errors(
@@ -86,3 +89,14 @@ def test_cli_reap_limit(dsn: str, conn: Conn, capsys: pytest.CaptureFixture[str]
     time.sleep(0.01)
     assert main(["--dsn", dsn, "reap", "--limit", "2"]) == 0
     assert len(json.loads(capsys.readouterr().out)["requeued"]) == 2
+
+
+def test_cli_prune(dsn: str, conn: Conn, capsys: pytest.CaptureFixture[str]) -> None:
+    enqueue(conn, "q")
+    [job] = claim(conn, "q", "w")
+    complete(conn, job)
+    assert main(["--dsn", dsn, "prune", "--older-than", "3600"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"jobs": 0, "outbox": 0}
+    time.sleep(0.01)
+    assert main(["--dsn", dsn, "prune", "--older-than", "0", "--states", "done"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"jobs": 1, "outbox": 0}

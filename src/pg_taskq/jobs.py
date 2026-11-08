@@ -21,8 +21,9 @@ different hosts never compare their own clocks. Tests pass `now=` to control tim
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import random
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, fields
 from enum import StrEnum
 from typing import Any, Final
@@ -61,6 +62,23 @@ def check_name(value: str, what: str) -> str:
     if clean_text(value, limit=len(value) * 10 + 10) != value:
         raise ValueError(f"{what} contains a NUL byte or an unencodable character")
     return value
+
+
+def channel_for(queue: str) -> str:
+    """The LISTEN/NOTIFY channel that wakes the workers of `queue`.
+
+    A fixed prefix plus a hash of the name, so any queue name (spaces, quotes, non-ASCII, more
+    than 63 bytes) maps to a short, lowercase, always-valid identifier that needs no quoting.
+    """
+    return "taskq_" + hashlib.sha256(check_name(queue, "queue").encode()).hexdigest()[:24]
+
+
+def _notify(conn: psycopg.Connection[Any], queues: Iterable[str]) -> None:
+    # pg_notify() takes the channel as a value, so nothing is spliced into SQL. Delivered at
+    # commit, and only then: a rolled-back enqueue wakes nobody. Identical notifications in one
+    # transaction are folded into one by PostgreSQL.
+    for queue in sorted(set(queues)):
+        conn.execute("SELECT pg_notify(%s, '')", (channel_for(queue),))
 
 
 def check_aware(value: dt.datetime | None, what: str) -> dt.datetime | None:
@@ -134,10 +152,15 @@ def enqueue(
     priority: int = 0,
     max_attempts: int = 5,
     idempotency_key: str | None = None,
+    notify: bool = True,
     now: dt.datetime | None = None,
 ) -> int:
     """Add a job and return its id. With an `idempotency_key` that already exists in this queue,
-    nothing is inserted and the existing job's id is returned (whatever its state)."""
+    nothing is inserted and the existing job's id is returned (whatever its state).
+
+    A job that is due at once also sends a NOTIFY on the queue's channel when the enqueueing
+    transaction commits, so idle workers wake without waiting for their next poll. Pass
+    `notify=False` for bulk loads (workers still find the jobs by polling)."""
     check_name(queue, "queue")
     check_aware(run_at, "run_at")
     check_aware(now, "now")
@@ -167,10 +190,12 @@ def enqueue(
             VALUES (%(queue)s, %(payload)s, %(priority)s, %(max_attempts)s, %(key)s,
                     coalesce(%(run_at)s::timestamptz, {NOW} + %(delay)s), {NOW}, {NOW})
             ON CONFLICT (queue, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-            RETURNING id
+            RETURNING id, run_at <= {NOW} AS due
             """,  # noqa: S608  (NOW is a constant SQL fragment, all values are bound)
             params,
         ).fetchone()
+        if row is not None and notify and row[1]:
+            _notify(conn, [queue])
         if row is None:
             row = conn.execute(
                 "SELECT id FROM taskq_jobs WHERE queue = %s AND idempotency_key = %s",
@@ -343,10 +368,11 @@ def reap(
                 last_error = 'lease expired (worker ' || j.locked_by || ' stopped heartbeating)',
                 lease_token = NULL, locked_by = NULL, locked_until = NULL, updated_at = {NOW}
             FROM stale WHERE j.id = stale.id
-            RETURNING j.id, j.state
+            RETURNING j.id, j.state, j.queue
             """,  # noqa: S608
             {"limit": limit, "now": now},
         ).fetchall()
+        _notify(conn, [str(r[2]) for r in rows if r[1] == "queued"])
     return Reaped(
         requeued=sorted(int(r[0]) for r in rows if r[1] == "queued"),
         dead=sorted(int(r[0]) for r in rows if r[1] == "dead"),

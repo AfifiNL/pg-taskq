@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import psycopg
+from psycopg import sql
 
 from pg_taskq import jobs
 from pg_taskq.jobs import Backoff, Job, check_name, describe_error
@@ -59,14 +60,21 @@ class WorkerStats:
     dead: int = 0
     lost: int = 0
     reconnects: int = 0
+    wakeups: int = 0  # idle waits ended early by a NOTIFY
 
 
 class _Link:
     """One connection that is re-opened on demand after it breaks."""
 
-    def __init__(self, connect: Connect, stats: WorkerStats) -> None:
+    def __init__(
+        self,
+        connect: Connect,
+        stats: WorkerStats,
+        on_connect: Callable[[psycopg.Connection[Any]], None] | None = None,
+    ) -> None:
         self._connect = connect
         self._stats = stats
+        self._on_connect = on_connect
         self._conn: psycopg.Connection[Any] | None = None
         self._opened = False
 
@@ -75,11 +83,17 @@ class _Link:
             self.reset()
             conn = self._connect()
             conn.autocommit = True
+            if self._on_connect is not None:
+                self._on_connect(conn)
             self._conn = conn
             if self._opened:
                 self._stats.reconnects += 1
             self._opened = True
         return self._conn
+
+    @property
+    def connected(self) -> bool:
+        return self._conn is not None and not self._conn.closed and not self._conn.broken
 
     def reset(self) -> None:
         if self._conn is not None:
@@ -124,6 +138,7 @@ class Worker:
         reap_every: float | None = 30.0,
         backoff: Backoff | None = None,
         transactional: bool = True,
+        listen: bool = True,
         reconnect_backoff: Backoff | None = None,
     ) -> None:
         check_name(queue, "queue")
@@ -138,13 +153,20 @@ class Worker:
         self.reap_every = reap_every
         self.backoff = backoff or Backoff()
         self.transactional = transactional
+        self.listen = listen
+        self.channel = jobs.channel_for(queue)
         self.reconnect_backoff = reconnect_backoff or Backoff(
             base=dt.timedelta(milliseconds=200), cap=dt.timedelta(seconds=10)
         )
         self.stats = WorkerStats()
         self._main = _Link(connect, self.stats)
         self._beat_link = _Link(connect, self.stats)
+        # Wake-ups: a third connection that only LISTENs on the queue's channel.
+        self._listen_link = _Link(connect, self.stats, on_connect=self._listen_on)
         self._stop = threading.Event()
+
+    def _listen_on(self, conn: psycopg.Connection[Any]) -> None:
+        conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(self.channel)))
 
     def stop(self) -> None:
         """Finish the current job (if any), then return from `run`."""
@@ -158,6 +180,8 @@ class Worker:
             while not self._stop.is_set():
                 if max_jobs is not None and handled >= max_jobs:
                     break
+                if self.listen:
+                    self._ensure_listening()
                 try:
                     conn = self._main.get()
                     if self.reap_every is not None and time.monotonic() - last_reap >= (
@@ -184,14 +208,59 @@ class Worker:
                 if not claimed:
                     if until_empty:
                         break
-                    self._stop.wait(self.poll_interval)
+                    self._idle()
                     continue
                 self._process(claimed[0])
                 handled += 1
         finally:
             self._main.reset()
             self._beat_link.reset()
+            self._listen_link.reset()
         return self.stats
+
+    def _ensure_listening(self) -> None:
+        """LISTEN before claiming: a job enqueued after an empty claim then leaves a notification
+        waiting, and the idle wait returns at once. Best effort: if LISTEN fails, the worker
+        keeps claiming and falls back to polling (notifications are only an optimisation)."""
+        try:
+            self._listen_link.get()
+        except psycopg.Error as exc:
+            log.warning("cannot LISTEN (%s); polling", describe_error(exc))
+            self._listen_link.reset()
+
+    def _idle(self) -> None:
+        """Wait up to `poll_interval` for a NOTIFY on the queue's channel (or for stop()).
+
+        A notification only shortens the wait: if one is lost (the listening connection broke,
+        or a job was enqueued with notify=False), the next poll finds the job anyway.
+        """
+        deadline = time.monotonic() + self.poll_interval
+        if not (self.listen and self._listen_link.connected):
+            self._stop.wait(self.poll_interval)
+            return
+        conn = self._listen_link.get()
+        try:
+            while not self._stop.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                # Short slices keep stop() responsive. The generator holds the connection's
+                # lock while it runs, so finish it before touching the connection again.
+                pending = conn.notifies(timeout=min(remaining, 0.25), stop_after=1)
+                try:
+                    woke = next(pending, None) is not None
+                finally:
+                    pending.close()  # releases the connection lock the generator holds
+                if woke:
+                    # Several commits may have notified; one claim round serves them all.
+                    for _ in conn.notifies(timeout=0):
+                        pass
+                    self.stats.wakeups += 1
+                    return
+        except psycopg.Error as exc:
+            log.warning("listen connection lost (%s); polling", describe_error(exc))
+            self._listen_link.reset()
+            self._stop.wait(max(0.0, deadline - time.monotonic()))
 
     def _process(self, job: Job) -> None:
         beat = _Heartbeat(self._beat_link, job, self.lease, self.heartbeat_every)
