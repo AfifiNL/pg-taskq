@@ -36,6 +36,7 @@ from psycopg.types.json import Jsonb
 NOW: Final = "coalesce(%(now)s::timestamptz, statement_timestamp())"
 MAX_ERROR_CHARS: Final = 2000
 INT32_MAX: Final = 2**31 - 1
+ENQUEUE_ATTEMPTS: Final = 3
 
 
 def clean_text(text: str, limit: int = MAX_ERROR_CHARS) -> str:
@@ -64,21 +65,36 @@ def check_name(value: str, what: str) -> str:
     return value
 
 
-def channel_for(queue: str) -> str:
-    """The LISTEN/NOTIFY channel that wakes the workers of `queue`.
+# The LISTEN/NOTIFY channel of a queue. NOTIFY channels are per *database*, while the tables live
+# in a schema, so the channel hashes the schema the tables are in (current_schema(), the first
+# existing schema on the search_path) together with the queue name. A fixed prefix plus 24 hex
+# characters is always a short, lowercase, valid identifier whatever the names are (spaces,
+# quotes, non-ASCII, longer than PostgreSQL's 63-byte limit). Computed in SQL, so producers need
+# no extra round trip to learn their schema; `channel_for()` is the same function in Python.
+CHANNEL_SQL: Final = (
+    "'taskq_' || left(encode(sha256(convert_to("
+    "coalesce(current_schema(), '') || chr(31) || {queue}, 'UTF8')), 'hex'), 24)"
+)
 
-    A fixed prefix plus a hash of the name, so any queue name (spaces, quotes, non-ASCII, more
-    than 63 bytes) maps to a short, lowercase, always-valid identifier that needs no quoting.
-    """
-    return "taskq_" + hashlib.sha256(check_name(queue, "queue").encode()).hexdigest()[:24]
+
+def channel_for(queue: str, schema: str = "public") -> str:
+    """The channel the workers of `queue` LISTEN on, for tables in `schema`."""
+    check_name(queue, "queue")
+    digest = hashlib.sha256(f"{schema}\x1f{queue}".encode()).hexdigest()
+    return "taskq_" + digest[:24]
 
 
 def _notify(conn: psycopg.Connection[Any], queues: Iterable[str]) -> None:
     # pg_notify() takes the channel as a value, so nothing is spliced into SQL. Delivered at
     # commit, and only then: a rolled-back enqueue wakes nobody. Identical notifications in one
     # transaction are folded into one by PostgreSQL.
-    for queue in sorted(set(queues)):
-        conn.execute("SELECT pg_notify(%s, '')", (channel_for(queue),))
+    names = sorted(set(queues))
+    if names:
+        conn.execute(
+            f"SELECT pg_notify({CHANNEL_SQL.format(queue='q')}, '') "  # noqa: S608
+            "FROM unnest(%s::text[]) AS t(q)",
+            (names,),
+        )
 
 
 def check_aware(value: dt.datetime | None, what: str) -> dt.datetime | None:
@@ -152,15 +168,18 @@ def enqueue(
     priority: int = 0,
     max_attempts: int = 5,
     idempotency_key: str | None = None,
-    notify: bool = True,
+    notify: bool = False,
     now: dt.datetime | None = None,
 ) -> int:
     """Add a job and return its id. With an `idempotency_key` that already exists in this queue,
     nothing is inserted and the existing job's id is returned (whatever its state).
 
-    A job that is due at once also sends a NOTIFY on the queue's channel when the enqueueing
-    transaction commits, so idle workers wake without waiting for their next poll. Pass
-    `notify=False` for bulk loads (workers still find the jobs by polling)."""
+    With `notify=True`, a job that is due at once also sends a NOTIFY on the queue's channel when
+    the enqueueing transaction commits, so workers created with `listen=True` wake without
+    waiting for their next poll. Off by default, because it has costs: PostgreSQL serialises
+    the commits of all transactions that sent a NOTIFY (database-wide), such a transaction cannot
+    be prepared for two-phase commit, and if the notification queue fills up (a listener that
+    stopped reading) those commits fail. See docs/DESIGN.md."""
     check_name(queue, "queue")
     check_aware(run_at, "run_at")
     check_aware(now, "now")
@@ -182,28 +201,40 @@ def enqueue(
         "key": idempotency_key,
         "now": now,
     }
-    with conn.transaction():
-        row = conn.execute(
-            f"""
-            INSERT INTO taskq_jobs (queue, payload, priority, max_attempts, idempotency_key,
-                                    run_at, created_at, updated_at)
-            VALUES (%(queue)s, %(payload)s, %(priority)s, %(max_attempts)s, %(key)s,
-                    coalesce(%(run_at)s::timestamptz, {NOW} + %(delay)s), {NOW}, {NOW})
-            ON CONFLICT (queue, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-            RETURNING id, run_at <= {NOW} AS due
-            """,  # noqa: S608  (NOW is a constant SQL fragment, all values are bound)
-            params,
-        ).fetchone()
-        if row is not None and notify and row[1]:
-            _notify(conn, [queue])
-        if row is None:
+    for _ in range(ENQUEUE_ATTEMPTS):
+        with conn.transaction():
             row = conn.execute(
-                "SELECT id FROM taskq_jobs WHERE queue = %s AND idempotency_key = %s",
-                (queue, idempotency_key),
+                f"""
+                INSERT INTO taskq_jobs (queue, payload, priority, max_attempts, idempotency_key,
+                                        run_at, created_at, updated_at)
+                VALUES (%(queue)s, %(payload)s, %(priority)s, %(max_attempts)s, %(key)s,
+                        coalesce(%(run_at)s::timestamptz, {NOW} + %(delay)s), {NOW}, {NOW})
+                ON CONFLICT (queue, idempotency_key) WHERE idempotency_key IS NOT NULL
+                DO NOTHING
+                RETURNING id, run_at <= {NOW} AS due
+                """,  # noqa: S608  (NOW is a constant SQL fragment, all values are bound)
+                params,
             ).fetchone()
-        if row is None:  # pragma: no cover - the conflicting row cannot vanish in between
-            raise RuntimeError("idempotent enqueue found neither a new nor an existing row")
-        return int(row[0])
+            if row is not None:
+                if notify and row[1]:
+                    _notify(conn, [queue])
+                return int(row[0])
+            existing = _existing_id(conn, queue, idempotency_key)
+            if existing is not None:
+                return existing
+        # The conflicting row was deleted (pruned) between the INSERT and the SELECT: the key
+        # is free again, so try the insert once more.
+    raise RuntimeError(
+        f"idempotent enqueue did not settle after {ENQUEUE_ATTEMPTS} attempts "
+        "(the conflicting job kept disappearing)"
+    )
+
+
+def _existing_id(conn: psycopg.Connection[Any], queue: str, key: str | None) -> int | None:
+    row = conn.execute(
+        "SELECT id FROM taskq_jobs WHERE queue = %s AND idempotency_key = %s", (queue, key)
+    ).fetchone()
+    return None if row is None else int(row[0])
 
 
 def claim(

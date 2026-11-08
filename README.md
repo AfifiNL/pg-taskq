@@ -2,10 +2,10 @@
 
 Durable background jobs for Python on **plain PostgreSQL**: atomic claims with
 `FOR UPDATE SKIP LOCKED`, leases kept alive by heartbeats, a reaper for crashed workers, retries
-with exponential backoff and jitter, a dead state for jobs that keep failing, LISTEN/NOTIFY
-wake-ups with polling as the fallback, batched retention, and a **transactional outbox** for
+with exponential backoff and jitter, a dead state for jobs that keep failing, optional
+LISTEN/NOTIFY wake-ups on top of polling, batched retention, and a **transactional outbox** for
 publishing events reliably. No broker, no extension, no ORM:
-about 1,250 lines of typed Python (psycopg 3) and SQL, docstrings included. Needs PostgreSQL 13
+about 1,450 lines of typed Python (psycopg 3) and SQL, docstrings included. Needs PostgreSQL 13
 or newer (`gen_random_uuid()`); tested on 16.2 and 17.
 
 ```python
@@ -34,7 +34,7 @@ package, so nothing else is needed.
 make install   # .venv with dev tools and the bundled PostgreSQL
 make check     # ruff, mypy --strict, the tests against a real PostgreSQL, and the demo
 make demo      # just the demo: 3 workers, retries, a crashed worker, a poison job, the outbox
-make bench     # optional, about a minute: throughput and claim latency on your machine
+make bench     # optional, a minute or two: throughput and latency on your machine
 ```
 
 As a dependency: `psycopg` needs libpq. Install the `binary` extra (`pg-taskq[binary]`, which
@@ -71,6 +71,21 @@ uv run pg-taskq reap --limit 100   # requeue jobs whose lease expired
 uv run pg-taskq prune --older-than 604800   # drop jobs/messages finished over 7 days ago
 ```
 
+### Migrations
+
+`migrate()` creates or upgrades the tables. When a migration changes existing tables it takes
+SHARE locks on them (blocking writes while it runs), waits at most `lock_timeout` (1 s) for them
+without holding any other lock, and retries with backoff; it cannot deadlock with your job
+transactions. Run it at deploy time. On large tables, build migration 2's indexes beforehand
+without blocking writes; `migrate()` then only checks them:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS taskq_jobs_finished
+    ON taskq_jobs (finished_at) WHERE state IN ('done', 'dead');
+CREATE INDEX CONCURRENTLY IF NOT EXISTS taskq_outbox_published
+    ON taskq_outbox (published_at) WHERE published_at IS NOT NULL;
+```
+
 ## How it works
 
 ```text
@@ -104,9 +119,12 @@ enqueue ──► queued ──claim (SKIP LOCKED, attempts+1, new lease token)�
   recorded is taken back by the reaper when its lease expires.
 - **Transactional outbox.** `outbox.add()` writes the message in your transaction: it exists if
   and only if your change committed. A relay publishes committed messages at least once.
-- **Wake-ups without busy polling.** Enqueueing a due job sends a NOTIFY on the queue's
-  channel when the transaction commits; idle workers LISTEN and wake at once. A lost
-  notification only costs latency: workers still poll every `poll_interval`.
+- **Optional wake-ups.** With `enqueue(..., notify=True)` and `Worker(..., listen=True)`, a due
+  job sends a NOTIFY when its transaction commits and idle workers wake at once instead of at
+  their next poll. Off by default because it costs: PostgreSQL serialises the commits of
+  transactions that NOTIFY (see the benchmark), they cannot use two-phase commit, and a listener
+  that stops reading can fill the server's notification queue. A lost notification only costs
+  latency: workers still poll every `poll_interval`.
 - **Retention.** `prune()` (and `pg-taskq prune`) deletes old `done`/`dead` jobs and published
   outbox messages in small batches with `SKIP LOCKED`, so it can run next to busy workers.
 - **One clock.** All time comparisons use the database clock, never the workers' clocks.
@@ -118,18 +136,17 @@ Details and the reasons behind each choice: [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Tests
 
-`make check` runs ruff, `mypy --strict`, 90 tests and the demo. In the last local run the tests
-took 27.5 s (the machine was busy with other work); all of them run against a real PostgreSQL:
-the bundled `pgserver` (PostgreSQL 16.2) locally, a PostgreSQL 17 service container in CI. Each
-test session works in a schema of its own that it creates and drops, so a test database URL
-cannot touch real taskq tables.
+`make check` runs ruff, `mypy --strict`, 106 tests and the demo. In the last local run the tests
+took 43.5 s; all of them run against a real PostgreSQL: the bundled `pgserver` (PostgreSQL 16.2)
+locally, a PostgreSQL 17 service container in CI. Each test session works in a schema of its own
+that it creates and drops, so a test database URL cannot touch real taskq tables.
 
 - **Model-based property test** (Hypothesis): random sequences of enqueue, claim, heartbeat,
   complete, fail, worker crashes, clock jumps and reaps by two workers, checked after every step
   against a model of every job's state, attempts, due time and lease owner. Pinned examples cover
   the "claim, lease expires, reaped, re-claimed, the stale worker acts" chain.
   100 random examples per run by default; `PGTASKQ_PROPERTY_EXAMPLES=1000 make test` runs more.
-- **Mutation check.** Five bugs were planted one at a time; the suite fails on each:
+- **Mutation check.** Bugs were planted one at a time; the suite fails on each:
 
   | planted bug | caught by |
   |---|---|
@@ -138,15 +155,28 @@ cannot touch real taskq tables.
   | `heartbeat()` ignores the lease token | property test, a unit test |
   | `fail()` ignores the lease token | property test, a unit test |
   | `reap()` without `SKIP LOCKED` | the "an open reap does not block another" test only |
+  | `prune()` without `SKIP LOCKED` | the "prune skips rows locked by others" test |
+  | LISTEN not re-issued after a reconnect | the "LISTEN is re-issued after a kill" test |
+  | LISTEN moved after the empty claim | the "LISTEN happens before the claim" test (and the above) |
+  | migration takes its second lock without `NOWAIT` | the "never waits while holding a lock" test |
+  | the earlier migration code (no locks, no timeout, no retry) | `DeadlockDetected` in the deadlock test |
+  | idempotent enqueue without the retry | the prune-race test |
 
 - **Races on separate connections:** 8 connections claim 400 jobs at once (no job claimed
   twice); 4 reapers take 300 expired jobs (each once); heartbeats race a reaper over 200 jobs
   (exactly one side wins each job); an open reap does not block another.
-- **Wake-ups:** a worker idling with a 30 s poll interval picks up a new job in under a second;
-  a job enqueued without a notification is still found by the next poll; killing the LISTEN
-  connection falls back to polling and re-LISTENs; notifications are sent on commit only.
+- **Wake-ups:** a worker idling with a 30 s poll interval picks up a notified job in under a
+  second; a job enqueued right after an empty claim still wakes it (LISTEN comes first); after
+  its LISTEN connection is killed it re-LISTENs and the next notified job is again picked up at
+  once; a job without a notification is found by the next poll; two schemas in one database do
+  not wake each other; notifications are sent on commit only.
 - **Retention:** `prune()` running next to four claiming workers, and four prunes in parallel,
-  each delete every finished row exactly once; queued and running jobs are never touched.
+  each delete every finished row exactly once; a row locked by another connection is skipped,
+  not waited for; queued and running jobs are never touched; a prune between an idempotent
+  enqueue's insert and its lookup is retried, not an error.
+- **Migrations:** migrating while an application transaction holds the tables (in both lock
+  orders) completes without a deadlock; a lock that stays held ends in `MigrationLockError`;
+  indexes built concurrently beforehand are accepted and an INVALID one is refused.
 - **Worker:** heartbeats keep a job alive past its lease while a reaper runs; killing the
   heartbeat or the main connection mid-run is survived; error text with NUL bytes is stored
   escaped; a lost lease rolls back the handler's writes (default mode) or is fenced and counted
@@ -154,32 +184,47 @@ cannot touch real taskq tables.
 
 ## Benchmark
 
-`make bench` (not part of `make check`) starts a throwaway PostgreSQL, puts 20,000 no-op jobs on a
-queue per scenario, lets 8 worker processes drain it, and fails unless every job was processed
-exactly once (ids collected from all processes, and the final counts in the database).
+`make bench` (not part of `make check`) starts a throwaway PostgreSQL and runs seven scenarios
+with separate processes (details in [`docs/DESIGN.md`](docs/DESIGN.md#benchmark-method)). It
+printed this table for the code in this repository:
 
-| scenario | what runs | jobs/s | claim p50 | claim p95 |
-|---|---|---|---|---|
-| loop-1 | `claim(limit=1)` → `complete()` | 1,409 | 2.66 ms | 4.56 ms |
-| loop-10 | `claim(limit=10)` → `complete()` per job | 2,433 | 4.10 ms | 6.43 ms |
-| worker | the `Worker` class (heartbeat thread per job) | 1,312 | – | – |
+| scenario | processes | jobs | jobs/s | claim p50 ms | claim p95 ms | pickup p50 ms | pickup p95 ms |
+|---|---|---|---|---|---|---|---|
+| enqueue | 8 | 20,000 | 2,544 | n/a | n/a | n/a | n/a |
+| enqueue+notify | 8 | 20,000 | 660 | n/a | n/a | n/a | n/a |
+| loop-1 | 8 | 20,000 | 1,067 | 4.32 | 5.31 | n/a | n/a |
+| loop-10 | 8 | 20,000 | 2,704 | 2.58 | 3.51 | n/a | n/a |
+| worker | 8 | 20,000 | 1,237 | n/a | n/a | n/a | n/a |
+| pickup-poll | 1 | 20 | n/a | n/a | n/a | 909.5 | 911.0 |
+| pickup-notify | 1 | 20 | n/a | n/a | n/a | 4.9 | 6.0 |
 
-**Read these as one machine on one evening, not as a performance claim.** Measured on
-2026-11-08 (22:13 UTC) on an Intel Core i7-9700K (8 cores), NVMe SSD, PostgreSQL 16.2 from
-`pgserver` with default settings (`fsync` and `synchronous_commit` on, `shared_buffers` 128 MB),
-Python 3.12.3, psycopg 3.3.8. The machine was running other work (load average 2.5 at the
-start). Every `complete()` is a commit, so the disk's flush latency bounds throughput. A run two
-minutes earlier gave 1,190 / 2,193 / 1,359 jobs/s, so differences of 10–15 % between rows or runs
-are noise. Each job is a no-op: these numbers measure the queue's overhead, not real work.
+- **enqueue / enqueue+notify:** 8 producers, one transaction per enqueue. The default (no
+  NOTIFY) is about 4× faster here: PostgreSQL serialises the commits of transactions that
+  NOTIFY. This is why wake-ups are opt-in.
+- **loop-1, loop-10, worker:** 8 processes drain 20,000 no-op jobs; every job was processed
+  exactly once (a sanity check of a clean run, not a fault-injection test).
+- **pickup-poll / pickup-notify:** one idle worker with a 1 s poll interval, jobs enqueued
+  100 ms apart. With polling, that regular spacing lines up with the poll so pickups cluster near
+  0.9 s; with random arrivals the average wait would be about half the poll interval. With
+  wake-ups, a job starts a few milliseconds after its commit.
+
+**One run on one desktop machine** (8 threads, NVMe SSD, PostgreSQL 16 with default settings,
+other work running at the same time), not a performance claim. Every `complete()` is a commit,
+so the disk's flush latency bounds the drain rates. Earlier runs of the drain scenarios varied
+by 10–15 %, so treat differences of that size as noise. The jobs are no-ops: these numbers
+measure the queue's overhead, not real work.
 
 ## Limits (v0.1)
 
 - **At-least-once execution.** A handler can run more than once (lost lease, crash after a side
   effect). Only database writes made in the handler's transaction (default mode) are
   exactly-once; e-mails, HTTP calls and other outside effects must be idempotent.
-- **LISTEN needs a session.** Each worker holds three connections (loop, heartbeat, LISTEN).
-  Behind a pooler in transaction mode (for example PgBouncer with `pool_mode = transaction`)
-  LISTEN does not work: pass `listen=False` and rely on polling there.
+- **Wake-ups need a direct or session-mode connection.** A `listen=True` worker holds three
+  connections (loop, heartbeat, LISTEN). Under transaction pooling (for example PgBouncer with
+  `pool_mode = transaction`) the LISTEN lands on whichever server connection ran it, and
+  notifications are lost or go to other clients; leave wake-ups off there. While a worker runs
+  one long job, its LISTEN connection is not read; notifications for it queue up on the server
+  until the job ends.
 - **Retention is not automatic.** Call `prune()` or `pg-taskq prune` from a scheduled task.
   Pruning a job frees its idempotency key.
 - **No delivery order for the outbox.** A relay sends a batch in id order, but ids are assigned

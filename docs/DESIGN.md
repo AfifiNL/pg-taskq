@@ -104,37 +104,83 @@ commit, a failed message waits for its retry while later ones go out, and parall
 interleave. A per-key ordering would need the relay to stop at a key's first failure and a
 single relay per key; that is not built.
 
-**Wake-ups: LISTEN/NOTIFY, with polling as the safety net.** A job that is due at once makes
-`enqueue()` call `pg_notify()` on its queue's channel in the same transaction; PostgreSQL delivers
-it at commit, and only then, so a rolled-back enqueue wakes nobody, and several enqueues in one
-transaction fold into one notification. The reaper notifies the queues of the jobs it requeues.
-Delayed jobs and retries (whose `run_at` is in the future) send nothing: nobody could take them
-yet. Each `Worker` keeps a third connection that only LISTENs; when a claim comes back empty it
-waits on that connection for up to `poll_interval`, in 0.25 s slices so `stop()` stays prompt.
-A notification only shortens the wait. If one is lost (the listening connection broke, a job was
-enqueued with `notify=False`, a connection pooler in transaction mode swallowed it), the next poll
-finds the job. Polling is the correctness mechanism; notifications are a latency optimisation.
+**Wake-ups: LISTEN/NOTIFY, opt-in, with polling as the safety net.** With
+`enqueue(..., notify=True)`, a job that is due at once calls `pg_notify()` on its queue's channel
+in the same transaction; PostgreSQL delivers it at commit, and only then, so a rolled-back enqueue
+wakes nobody, and several enqueues in one transaction fold into one notification. The reaper
+notifies the queues of the jobs it requeues. Delayed jobs and retries (whose `run_at` is in the
+future) send nothing: nobody could take them yet. A `Worker(listen=True)` keeps a third
+connection that only LISTENs; when a claim comes back empty it waits on that connection for up to
+`poll_interval`, in 0.25 s slices so `stop()` stays prompt. A notification only shortens the
+wait: if one is lost, the next poll finds the job. Polling is the correctness mechanism;
+notifications are a latency optimisation.
+
+*Why opt-in.* The first version notified on every enqueue by default. A review measured the cost
+and found two failure modes, all documented PostgreSQL behaviour:
+- PostgreSQL serialises the commits of transactions that issued NOTIFY, database-wide (a global
+  lock on the notification queue at commit). `make bench` measures both paths with 8 producers,
+  one transaction per enqueue; the README's table has the result for one machine.
+- A transaction that issued NOTIFY cannot be prepared for two-phase commit (PREPARE TRANSACTION
+  fails), so a default NOTIFY would break callers that enqueue inside 2PC.
+- Notifications wait in a server-wide queue (8 GB by default) until every listening session has
+  read them. A listener that stops reading holds the queue back; when it fills, every commit that
+  NOTIFYs fails. Workers therefore drain their LISTEN connection after every job as well as when
+  idle, but one very long job still leaves it unread for that long.
+Off by default, the queue pays none of these costs unless asked; turning it on is two arguments.
 
 - The LISTEN is (re-)established *before* each claim. A job committed between an empty claim and
-  the wait therefore leaves a notification waiting, and the wait returns at once.
-- Channel names are `taskq_` plus 24 hex characters of the queue name's SHA-256: always a short,
-  lowercase, valid identifier, whatever the queue is called (spaces, quotes, non-ASCII, longer
-  than PostgreSQL's 63-byte limit). `pg_notify()` takes the channel as a bound value and LISTEN
-  uses `sql.Identifier`, so nothing is spliced into SQL.
+  the wait therefore leaves a notification waiting, and the wait returns at once (tested by
+  injecting an enqueue right after an empty claim, with a 30 s poll interval).
+- Channels are per database, tables are per schema. The channel is `taskq_` plus 24 hex
+  characters of SHA-256 over the table schema (`current_schema()`) and the queue name, so two
+  schemas in one database never wake each other (tested), and any name maps to a short, valid,
+  lowercase identifier. It is computed in SQL by both `enqueue()` and the worker, so producers
+  need no extra round trip; `pg_notify()` takes it as a bound value and LISTEN uses
+  `sql.Identifier`, so nothing is spliced into SQL.
+- The LISTEN connection gets TCP keepalives (30 s idle, 10 s interval, 3 probes) and a 60 s TCP
+  user timeout, and every `listen_check_every` seconds (60 by default) the worker re-issues its
+  LISTEN, a no-op round trip that proves the connection alive; a half-open connection then fails
+  within about a minute instead of waiting silently. A broken LISTEN connection is re-opened and
+  re-LISTENed at once, with backoff, not after the poll interval. If LISTEN keeps failing, the
+  worker logs once and keeps claiming by polling. A connection whose LISTEN failed is closed.
+- Poolers: under transaction pooling (PgBouncer `pool_mode = transaction`, for example) LISTEN
+  runs on whichever server connection served that statement; that server connection is then
+  handed to other clients, so notifications are lost or arrive elsewhere. Give `listen=True`
+  workers a direct or session-mode connection, or leave wake-ups off.
+- psycopg buffers notifications only on connections that LISTEN. Producer connections never
+  LISTEN, so they never accumulate notifications.
 - A bug found while building this: psycopg's `notifies()` generator holds the connection's lock
   while it is suspended, so draining extra notifications from inside the loop over the first one
-  deadlocked the worker. The test that kills the worker's main connection hung on it; the code
-  now closes the first generator before draining.
+  deadlocked the worker. The code closes the first generator before draining.
 
 **Retention in small batches.** `prune()` deletes `done`/`dead` jobs and published outbox messages
 older than a cut-off, in batches (`LIMIT` + `FOR UPDATE SKIP LOCKED`, 1,000 rows by default), each
-batch its own short transaction. It never waits on rows someone else holds and never holds many
-locks itself, so it can run next to busy workers (tested: four workers drain 600 jobs while a
-pruner deletes them as they finish; every job is processed once and deleted once). Queued and
-running jobs are never eligible; passing such a state is a `ValueError`. Pruning a job frees its
-idempotency key. Migration 2 adds the two partial indexes `prune()` uses. It runs inside the
-migration transaction, so it cannot use `CREATE INDEX CONCURRENTLY`: on a large existing table,
-apply it at a quiet time.
+batch its own short transaction. It never waits on rows someone else holds (tested with a row
+held `FOR UPDATE` by another connection and a 2 s statement timeout) and never holds many locks
+itself, so it can run next to busy workers (tested: four workers drain 600 jobs while a pruner
+deletes them as they finish; every job is processed once and deleted once). Queued and running
+jobs are never eligible; passing such a state is a `ValueError`. Pruning a job frees its
+idempotency key, and `enqueue()` handles the race where a prune deletes the conflicting row
+between its `INSERT … ON CONFLICT DO NOTHING` and the lookup of the existing id: it retries the
+insert (up to 3 attempts) instead of failing.
+
+**Migrations that touch busy tables.** Migration 2 adds the two partial indexes `prune()` uses.
+A review reproduced a deadlock in the first version: `migrate()` held SHARE on `taskq_jobs` (its
+first index build) and waited for `taskq_outbox`, while the README's own handler held a write lock
+on `taskq_outbox` (`outbox.add`) and waited for `taskq_jobs` (`complete`). Now:
+- before its DDL, a migration locks the tables it changes, waiting (bounded by `lock_timeout`,
+  1 s by default) only for the first while it holds no lock a job transaction could need, and
+  taking the rest with `NOWAIT`; it therefore never waits while holding a lock, and cannot be in a
+  deadlock with application transactions that touch the tables in either order (both orders are
+  tested against an open application transaction);
+- a timeout or a `NOWAIT` miss rolls the attempt back and retries with backoff (30 attempts by
+  default); after the last, `MigrationLockError` says what to do;
+- the index builds still block writes while they run. On large tables, build the indexes first
+  with `CREATE INDEX CONCURRENTLY IF NOT EXISTS …` (README); the migration uses `IF NOT EXISTS`
+  and then only checks that each index is valid, refusing to record the version on top of an
+  INVALID index left by a failed concurrent build (tested);
+- `migrate()` is meant for deploy time; calling it at every worker start is safe but takes these
+  locks briefly each time a migration is pending.
 
 **Schema.** Fixed table names (`taskq_jobs`, `taskq_outbox`, `taskq_schema_version`) in the
 connection's `search_path`. Numbered migrations run in one transaction under a transaction-scoped
@@ -191,9 +237,20 @@ re-raised in the test (a failing assertion in a plain thread only produces a war
 ## Benchmark method
 
 `bench/bench.py` (`make bench`) uses separate processes, not threads, so the numbers include no
-GIL contention between workers. Each scenario gets its own queue of no-op jobs, enqueued in one
-transaction with `notify=False` (setup, not measured). A barrier releases all workers at once;
-wall time runs from the barrier to the last result. Claim latency is timed around each `claim()`
-call in the loop scenarios (the `Worker` scenario reports throughput only). The run fails unless
-every job id appears exactly once across processes and the database counts every job `done`.
-Results, machine details and caveats are in the README; they are from two runs on one machine.
+GIL contention between workers or producers. A barrier releases all processes at once; each
+connects after the barrier (the `Worker` class connects lazily, so the loop scenarios do the same
+for comparable timing); wall time runs from the barrier to the last result, and a child that
+dies fails the run at once instead of after a timeout.
+
+- `enqueue` / `enqueue+notify`: 8 producers, one transaction per enqueue, without and with
+  `notify=True`. This is the measured cost of the NOTIFY commit serialisation.
+- `loop-1`, `loop-10`, `worker`: 8 processes drain 20,000 no-op jobs (enqueued in one
+  transaction beforehand, not measured); claim latency is timed around each `claim()` call in the
+  loop scenarios. The run fails unless every job id appears exactly once across processes and
+  the database counts every job `done`. That is a sanity check of a clean run, not a
+  fault-injection test.
+- `pickup-poll` / `pickup-notify`: one idle `Worker` with a 1 s poll interval; 20 jobs are
+  enqueued one at a time, 100 ms apart; the delay from the enqueue's commit to the handler's start
+  is measured, without and with wake-ups.
+
+Results and caveats are in the README.

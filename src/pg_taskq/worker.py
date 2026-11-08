@@ -5,10 +5,16 @@
 
     Worker(connect, "emails", handle, worker_id="host-1:pid").run()
 
-`connect` is a zero-argument callable returning a new connection. The worker keeps two: one for
-the loop and the handler, one for heartbeats (a connection runs one statement at a time, and a
-heartbeat must not wait behind a long handler query). Both are re-opened with backoff when they
-break (a restarted server, a killed backend, a network blip); `run()` logs and carries on.
+`connect` is a zero-argument callable returning a new connection. The worker keeps up to three:
+one for the loop and the handler, one for heartbeats (a connection runs one statement at a time,
+and a heartbeat must not wait behind a long handler query), and with `listen=True` one that only
+LISTENs for wake-ups. All are re-opened with backoff when they break (a restarted server, a
+killed backend, a network blip); `run()` logs and carries on.
+
+Wake-ups (`listen=True`) pair with `enqueue(..., notify=True)`; both are off by default (see
+docs/DESIGN.md for the costs). The LISTEN connection must reach PostgreSQL directly or through a
+session-mode pool: under transaction pooling the LISTEN lands on whichever server connection ran
+that statement, and the notifications are lost or delivered to other clients.
 
 Two modes, chosen with `transactional`:
 
@@ -31,6 +37,8 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import logging
+import os
+import socket
 import threading
 import time
 from collections.abc import Callable
@@ -61,6 +69,39 @@ class WorkerStats:
     lost: int = 0
     reconnects: int = 0
     wakeups: int = 0  # idle waits ended early by a NOTIFY
+    listen_checks: int = 0  # periodic re-LISTENs that proved the LISTEN connection alive
+
+
+# TCP keepalive and user-timeout settings for the LISTEN connection, which may sit idle for a
+# long time: a dead peer (a dropped NAT entry, a crashed host) is detected within about a minute
+# instead of the kernel default of hours, and the next read or write fails instead of hanging.
+KEEPALIVE_IDLE_S = 30
+KEEPALIVE_INTERVAL_S = 10
+KEEPALIVE_COUNT = 3
+USER_TIMEOUT_MS = 60_000
+
+
+def harden_socket(conn: Any) -> bool:
+    """Turn on aggressive TCP keepalives for a connection's socket. Returns False (and changes
+    nothing) for Unix-domain sockets or platforms without these options."""
+    try:
+        sock = socket.socket(fileno=os.dup(conn.pgconn.socket))
+    except (OSError, AttributeError, psycopg.Error):
+        return False
+    with sock:
+        if sock.family not in (socket.AF_INET, socket.AF_INET6):
+            return False
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (
+            ("TCP_KEEPIDLE", KEEPALIVE_IDLE_S),
+            ("TCP_KEEPINTVL", KEEPALIVE_INTERVAL_S),
+            ("TCP_KEEPCNT", KEEPALIVE_COUNT),
+            ("TCP_USER_TIMEOUT", USER_TIMEOUT_MS),
+        ):
+            option = getattr(socket, name, None)
+            if option is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, option, value)
+    return True
 
 
 class _Link:
@@ -82,9 +123,14 @@ class _Link:
         if self._conn is None or self._conn.closed or self._conn.broken:
             self.reset()
             conn = self._connect()
-            conn.autocommit = True
-            if self._on_connect is not None:
-                self._on_connect(conn)
+            try:
+                conn.autocommit = True
+                if self._on_connect is not None:
+                    self._on_connect(conn)
+            except BaseException:
+                with contextlib.suppress(psycopg.Error):  # don't leak a half-set-up connection
+                    conn.close()
+                raise
             self._conn = conn
             if self._opened:
                 self._stats.reconnects += 1
@@ -138,7 +184,8 @@ class Worker:
         reap_every: float | None = 30.0,
         backoff: Backoff | None = None,
         transactional: bool = True,
-        listen: bool = True,
+        listen: bool = False,
+        listen_check_every: float = 60.0,
         reconnect_backoff: Backoff | None = None,
     ) -> None:
         check_name(queue, "queue")
@@ -154,7 +201,10 @@ class Worker:
         self.backoff = backoff or Backoff()
         self.transactional = transactional
         self.listen = listen
-        self.channel = jobs.channel_for(queue)
+        self.listen_check_every = listen_check_every
+        self.channel: str | None = None  # learned from the database on the first LISTEN
+        self._last_listen_check = 0.0
+        self._listen_failing = False
         self.reconnect_backoff = reconnect_backoff or Backoff(
             base=dt.timedelta(milliseconds=200), cap=dt.timedelta(seconds=10)
         )
@@ -166,7 +216,18 @@ class Worker:
         self._stop = threading.Event()
 
     def _listen_on(self, conn: psycopg.Connection[Any]) -> None:
+        # The channel depends on the schema the tables are in; ask the database, which computes
+        # it exactly as enqueue() does.
+        row = conn.execute(
+            f"SELECT {jobs.CHANNEL_SQL.format(queue='%s')}",
+            (self.queue,),
+        ).fetchone()
+        if row is None:  # pragma: no cover
+            raise psycopg.InterfaceError("could not compute the queue's channel")
+        self.channel = str(row[0])
+        harden_socket(conn)
         conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(self.channel)))
+        self._last_listen_check = time.monotonic()
 
     def stop(self) -> None:
         """Finish the current job (if any), then return from `run`."""
@@ -211,6 +272,7 @@ class Worker:
                     self._idle()
                     continue
                 self._process(claimed[0])
+                self._drain_listen()
                 handled += 1
         finally:
             self._main.reset()
@@ -224,43 +286,80 @@ class Worker:
         keeps claiming and falls back to polling (notifications are only an optimisation)."""
         try:
             self._listen_link.get()
+            self._listen_failing = False
         except psycopg.Error as exc:
-            log.warning("cannot LISTEN (%s); polling", describe_error(exc))
+            if not self._listen_failing:  # log once per outage, not once per poll
+                log.warning("cannot LISTEN (%s); polling until it works", describe_error(exc))
+            self._listen_failing = True
             self._listen_link.reset()
 
     def _idle(self) -> None:
         """Wait up to `poll_interval` for a NOTIFY on the queue's channel (or for stop()).
 
-        A notification only shortens the wait: if one is lost (the listening connection broke,
-        or a job was enqueued with notify=False), the next poll finds the job anyway.
+        A notification only shortens the wait: if one is lost (the LISTEN connection broke, or a
+        job was enqueued without notify), the next poll finds the job anyway. A broken LISTEN
+        connection is re-opened (and re-LISTENed) at once, not after the poll interval.
         """
         deadline = time.monotonic() + self.poll_interval
-        if not (self.listen and self._listen_link.connected):
-            self._stop.wait(self.poll_interval)
-            return
-        conn = self._listen_link.get()
-        try:
-            while not self._stop.is_set():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return
+        failures = 0
+        while not self._stop.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            if not self.listen:
+                self._stop.wait(remaining)
+                return
+            try:
+                conn = self._listen_link.get()
+                self._check_listen(conn)
                 # Short slices keep stop() responsive. The generator holds the connection's
-                # lock while it runs, so finish it before touching the connection again.
+                # lock while it is suspended, so close it before touching the connection again.
                 pending = conn.notifies(timeout=min(remaining, 0.25), stop_after=1)
                 try:
                     woke = next(pending, None) is not None
                 finally:
-                    pending.close()  # releases the connection lock the generator holds
+                    pending.close()
                 if woke:
-                    # Several commits may have notified; one claim round serves them all.
-                    for _ in conn.notifies(timeout=0):
-                        pass
+                    self._drain(conn)  # several commits may have notified; one claim serves all
                     self.stats.wakeups += 1
                     return
-        except psycopg.Error as exc:
-            log.warning("listen connection lost (%s); polling", describe_error(exc))
+                failures = 0
+            except psycopg.Error as exc:
+                failures += 1
+                wait = min(remaining, self.reconnect_backoff.delay(failures).total_seconds())
+                log.warning(
+                    "LISTEN connection failed (%s); retrying in %.1f s", describe_error(exc), wait
+                )
+                self._listen_link.reset()
+                self._stop.wait(wait)
+
+    def _check_listen(self, conn: psycopg.Connection[Any]) -> None:
+        """Every `listen_check_every` seconds, re-issue the LISTEN (a no-op when already
+        listening). The round trip proves the connection is alive; with the keepalive settings
+        a half-open TCP connection fails here instead of waiting silently forever."""
+        if self.channel is None or (
+            time.monotonic() - self._last_listen_check < self.listen_check_every
+        ):
+            return
+        conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(self.channel)))
+        self._last_listen_check = time.monotonic()
+        self.stats.listen_checks += 1
+
+    @staticmethod
+    def _drain(conn: psycopg.Connection[Any]) -> None:
+        for _ in conn.notifies(timeout=0):
+            pass
+
+    def _drain_listen(self) -> None:
+        """Read pending notifications after each job, so a busy worker's LISTEN connection never
+        falls far behind (a listener that stops reading holds back PostgreSQL's notification
+        queue for everyone). Best effort."""
+        if not (self.listen and self._listen_link.connected):
+            return
+        try:
+            self._drain(self._listen_link.get())
+        except psycopg.Error:
             self._listen_link.reset()
-            self._stop.wait(max(0.0, deadline - time.monotonic()))
 
     def _process(self, job: Job) -> None:
         beat = _Heartbeat(self._beat_link, job, self.lease, self.heartbeat_every)

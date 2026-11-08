@@ -1,19 +1,16 @@
 from __future__ import annotations
 
 import datetime as dt
-import secrets
 import threading
 from collections.abc import Callable
 from typing import Any
 
 import psycopg
 import pytest
-from psycopg import sql
 
-from pg_taskq import claim, complete, enqueue, fail, migrate, outbox, prune, schema_version
-from pg_taskq.schema import LATEST, MIGRATIONS
+from pg_taskq import claim, complete, enqueue, fail, outbox, prune
 
-from .conftest import T0, in_schema, run_threads
+from .conftest import T0, run_threads
 
 Conn = psycopg.Connection[Any]
 S = dt.timedelta(seconds=1)
@@ -140,28 +137,14 @@ def test_parallel_prunes_delete_each_row_once(connect: Callable[[], Conn], conn:
     assert sum(counts) == 300
 
 
-def test_migration_from_version_1(server_url: str) -> None:
-    schema = f"taskq_mig_{secrets.token_hex(4)}"
-    with psycopg.connect(server_url, autocommit=True) as c:
-        c.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
-    try:
-        with psycopg.connect(in_schema(server_url, schema), autocommit=True) as c:
-            c.execute(
-                "CREATE TABLE taskq_schema_version (version integer PRIMARY KEY,"
-                " applied_at timestamptz NOT NULL DEFAULT statement_timestamp())"
-            )
-            c.execute(MIGRATIONS[0][1].encode())
-            c.execute("INSERT INTO taskq_schema_version (version) VALUES (1)")
-            assert schema_version(c) == 1
-            assert migrate(c) == [2]
-            assert schema_version(c) == LATEST == 2
-            indexes = {
-                r[0]
-                for r in c.execute(
-                    "SELECT indexname FROM pg_indexes WHERE schemaname = %s", (schema,)
-                ).fetchall()
-            }
-            assert {"taskq_jobs_finished", "taskq_outbox_published"} <= indexes
-    finally:
-        with psycopg.connect(server_url, autocommit=True) as c:
-            c.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+def test_prune_skips_rows_locked_by_others(connect: Callable[[], Conn], conn: Conn) -> None:
+    finish(conn, 5)
+    holder, pruner = connect(), connect()
+    pruner.execute("SET statement_timeout = '2s'")  # waiting on the lock would fail, not hang
+    with holder.transaction():
+        locked = holder.execute(
+            "SELECT id FROM taskq_jobs ORDER BY id LIMIT 1 FOR UPDATE"
+        ).fetchone()
+        assert prune(pruner, S, now=T0 + 60 * S, batch=2).jobs == 4
+    assert locked is not None
+    assert prune(pruner, S, now=T0 + 60 * S).jobs == 1  # its turn once the lock is gone

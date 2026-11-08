@@ -281,3 +281,37 @@ def test_numeric_bounds_are_checked_before_the_database(conn: Conn) -> None:
         enqueue(conn, "q", max_attempts=2**31)
     with pytest.raises(ValueError, match="limit"):
         reap(conn, limit=0)
+
+
+def test_idempotent_enqueue_survives_the_conflicting_row_being_pruned(
+    conn: Conn, connect: Callable[[], Conn], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pg_taskq.jobs as jobs_module
+
+    first = enqueue(conn, "q", idempotency_key="k", now=T0)
+    real = jobs_module._existing_id
+    other = connect()
+    calls: list[int] = []
+
+    def pruned_in_between(c: Conn, queue: str, key: str | None) -> int | None:
+        calls.append(1)
+        if len(calls) == 1:  # prune deletes the row after INSERT ... DO NOTHING saw it
+            other.execute("DELETE FROM taskq_jobs WHERE id = %s", (first,))
+        return real(c, queue, key)
+
+    monkeypatch.setattr(jobs_module, "_existing_id", pruned_in_between)
+    second = enqueue(conn, "q", idempotency_key="k", now=T0)
+    assert second != first
+    assert state(conn, second)["idempotency_key"] == "k"
+    assert len(calls) == 1  # the retry inserted without needing another lookup
+
+
+def test_idempotent_enqueue_gives_up_after_bounded_retries(
+    conn: Conn, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pg_taskq.jobs as jobs_module
+
+    enqueue(conn, "q", idempotency_key="k", now=T0)
+    monkeypatch.setattr(jobs_module, "_existing_id", lambda c, q, k: None)
+    with pytest.raises(RuntimeError, match="did not settle after 3 attempts"):
+        enqueue(conn, "q", idempotency_key="k", now=T0)
